@@ -69,7 +69,7 @@ def main() -> None:
     args = parse_args()
     device = choose_device(args.device)
 
-    checkpoint = torch.load(args.checkpoint, map_location=device)
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model, stats, use_deltas = build_model(checkpoint, device)
 
     items = iter_inputs(args.input)

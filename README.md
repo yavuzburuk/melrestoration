@@ -97,7 +97,23 @@ Training outputs:
 
 - `best.pt`: best validation checkpoint
 - `last.pt`: most recent checkpoint
+- `metrics.csv`: one row per epoch with `train_loss`, `val_loss`, `val_mae`, `val_ssim`, `val_lsd`, and `lr`
 - `stats.json`: shared normalization stats used for both input and target
+
+Resume training from the last checkpoint:
+
+```bash
+python -m melrestoration.train ^
+  --low-dir data/low ^
+  --high-dir data/high ^
+  --output-dir runs/refiner_v1 ^
+  --resume runs/refiner_v1/last.pt ^
+  --group-separator "_" ^
+  --batch-size 32 ^
+  --epochs 120
+```
+
+When resuming, `--epochs` is the total target epoch count, not the number of extra epochs. For example, if the checkpoint was saved at epoch `30` and you want to continue to epoch `120`, use `--epochs 120`.
 
 ## Inference
 

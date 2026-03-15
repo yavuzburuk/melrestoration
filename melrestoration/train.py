@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import csv
 import math
 import random
 from pathlib import Path
@@ -30,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--low-dir", type=Path, required=True, help="Directory with RVQ-VAE coarse mel .npy files.")
     parser.add_argument("--high-dir", type=Path, required=True, help="Directory with target high-detail mel .npy files.")
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory to store checkpoints and stats.")
+    parser.add_argument("--resume", type=Path, default=None, help="Resume training from a saved checkpoint.")
     parser.add_argument("--stats-path", type=Path, default=None, help="Optional path to an existing shared stats JSON.")
     parser.add_argument("--norm", choices=("none", "zscore"), default="zscore")
     parser.add_argument("--use-deltas", action=argparse.BooleanOptionalAction, default=True)
@@ -68,6 +70,22 @@ def choose_device(device_arg: str | None) -> torch.device:
     if device_arg:
         return torch.device(device_arg)
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def create_grad_scaler(device: torch.device, enabled: bool):
+    amp_enabled = enabled and device.type == "cuda"
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler(device.type, enabled=amp_enabled)
+    return torch.cuda.amp.GradScaler(enabled=amp_enabled)
+
+
+def autocast_context_manager(device: torch.device, enabled: bool):
+    amp_enabled = enabled and device.type == "cuda"
+    if not amp_enabled:
+        return contextlib.nullcontext
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        return lambda: torch.amp.autocast(device_type=device.type, dtype=torch.float16)
+    return torch.cuda.amp.autocast
 
 
 def make_loader(
@@ -123,24 +141,118 @@ def create_scheduler(args: argparse.Namespace, optimizer: torch.optim.Optimizer)
     return None
 
 
+def _serialize_arg_value(value):
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+def serialize_args(args: argparse.Namespace) -> dict[str, object]:
+    return {key: _serialize_arg_value(value) for key, value in vars(args).items()}
+
+
+def configure_from_checkpoint(args: argparse.Namespace, checkpoint: dict) -> None:
+    model_config = checkpoint.get("model_config", {})
+    checkpoint_use_deltas = bool(checkpoint.get("args", {}).get("use_deltas", model_config.get("in_channels", 1) > 1))
+    checkpoint_base_channels = int(model_config.get("base_channels", args.base_channels))
+    checkpoint_num_subbands = int(model_config.get("num_subbands", args.num_subbands))
+
+    if (
+        args.use_deltas != checkpoint_use_deltas
+        or args.base_channels != checkpoint_base_channels
+        or args.num_subbands != checkpoint_num_subbands
+    ):
+        print("Resuming with model settings stored in the checkpoint.")
+
+    args.use_deltas = checkpoint_use_deltas
+    args.base_channels = checkpoint_base_channels
+    args.num_subbands = checkpoint_num_subbands
+
+
+def resolve_training_stats(
+    args: argparse.Namespace,
+    train_pairs,
+    checkpoint: dict | None,
+) -> tuple[dict[str, float] | None, Path | None]:
+    if checkpoint is not None and "stats" in checkpoint:
+        stats = checkpoint["stats"]
+        if stats is None:
+            return None, None
+
+        resolved_path = args.stats_path or (args.output_dir / "stats.json")
+        if not resolved_path.exists():
+            save_stats(stats, resolved_path)
+        return stats, resolved_path
+
+    return resolve_stats(args.norm, args.stats_path, args.output_dir, train_pairs)
+
+
+def initialize_metrics_csv(path: Path, resume_epoch: int = 0) -> None:
+    fieldnames = ["epoch", "train_loss", "val_loss", "val_mae", "val_ssim", "val_lsd", "lr"]
+
+    if resume_epoch <= 0 or not path.exists():
+        with open(path, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+        return
+
+    with open(path, "r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        rows = [row for row in reader if int(row["epoch"]) <= resume_epoch]
+
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def append_metrics_csv(
+    path: Path,
+    epoch: int,
+    train_metrics: dict[str, float],
+    val_metrics: dict[str, float],
+    lr: float,
+) -> None:
+    with open(path, "a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["epoch", "train_loss", "val_loss", "val_mae", "val_ssim", "val_lsd", "lr"],
+        )
+        writer.writerow(
+            {
+                "epoch": epoch,
+                "train_loss": train_metrics["loss"],
+                "val_loss": val_metrics["loss"],
+                "val_mae": val_metrics["mae"],
+                "val_ssim": val_metrics["ssim"],
+                "val_lsd": val_metrics["lsd"],
+                "lr": lr,
+            }
+        )
+
+
 def save_checkpoint(
     path: Path,
     model: ProgressiveMelRefiner,
     optimizer: torch.optim.Optimizer,
     scheduler,
+    scaler: torch.cuda.amp.GradScaler | None,
     epoch: int,
     args: argparse.Namespace,
     stats: dict[str, float] | None,
     best_val_loss: float,
+    best_epoch: int,
 ) -> None:
     checkpoint = {
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
-        "args": vars(args),
+        "scaler_state_dict": scaler.state_dict() if scaler is not None and scaler.is_enabled() else None,
+        "args": serialize_args(args),
         "stats": stats,
         "best_val_loss": best_val_loss,
+        "best_epoch": best_epoch,
         "model_config": {
             "in_channels": 3 if args.use_deltas else 1,
             "base_channels": args.base_channels,
@@ -177,9 +289,7 @@ def run_epoch(
     }
     count = 0
 
-    autocast_context = (
-        torch.cuda.amp.autocast if amp_enabled and device.type == "cuda" else contextlib.nullcontext
-    )
+    autocast_context = autocast_context_manager(device, amp_enabled)
 
     for batch in loader:
         model_input = batch["input"].to(device, non_blocking=True)
@@ -231,6 +341,11 @@ def main() -> None:
 
     set_seed(args.seed)
     device = choose_device(args.device)
+    resume_checkpoint = (
+        torch.load(args.resume, map_location=device, weights_only=False) if args.resume is not None else None
+    )
+    if resume_checkpoint is not None:
+        configure_from_checkpoint(args, resume_checkpoint)
 
     all_pairs = collect_paired_files(args.low_dir, args.high_dir)
     train_pairs, val_pairs = split_pairs(
@@ -239,7 +354,7 @@ def main() -> None:
         seed=args.seed,
         group_separator=args.group_separator,
     )
-    stats, resolved_stats_path = resolve_stats(args.norm, args.stats_path, args.output_dir, train_pairs)
+    stats, resolved_stats_path = resolve_training_stats(args, train_pairs, resume_checkpoint)
 
     train_dataset = PairedMelDataset(train_pairs, stats=stats, use_deltas=args.use_deltas)
     val_dataset = PairedMelDataset(val_pairs, stats=stats, use_deltas=args.use_deltas)
@@ -275,17 +390,44 @@ def main() -> None:
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = create_scheduler(args, optimizer)
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device.type == "cuda")
+    scaler = create_grad_scaler(device, args.amp)
+    metrics_csv_path = args.output_dir / "metrics.csv"
 
     print(f"Device: {device}")
     print(f"Training pairs: {len(train_pairs)} | Validation pairs: {len(val_pairs)}")
     print(f"Input channels: {input_channels} | Shared stats: {resolved_stats_path or 'disabled'}")
 
+    start_epoch = 0
     best_val_loss = math.inf
     best_epoch = 0
     patience_counter = 0
 
-    for epoch in range(1, args.epochs + 1):
+    if resume_checkpoint is not None:
+        model.load_state_dict(resume_checkpoint["model_state_dict"])
+        optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+
+        scheduler_state_dict = resume_checkpoint.get("scheduler_state_dict")
+        if scheduler is not None and scheduler_state_dict is not None:
+            scheduler.load_state_dict(scheduler_state_dict)
+
+        scaler_state_dict = resume_checkpoint.get("scaler_state_dict")
+        if scaler is not None and scaler_state_dict is not None and scaler.is_enabled():
+            scaler.load_state_dict(scaler_state_dict)
+
+        start_epoch = int(resume_checkpoint.get("epoch", 0))
+        best_val_loss = float(resume_checkpoint.get("best_val_loss", math.inf))
+        best_epoch = int(resume_checkpoint.get("best_epoch", start_epoch if math.isfinite(best_val_loss) else 0))
+        print(f"Resuming from checkpoint {args.resume} at epoch {start_epoch}.")
+
+    if args.epochs <= start_epoch:
+        raise ValueError(
+            f"--epochs must be greater than the checkpoint epoch when resuming. "
+            f"Got --epochs {args.epochs} and checkpoint epoch {start_epoch}."
+        )
+
+    initialize_metrics_csv(metrics_csv_path, resume_epoch=start_epoch)
+
+    for epoch in range(start_epoch + 1, args.epochs + 1):
         train_metrics = run_epoch(
             model=model,
             loader=train_loader,
@@ -328,17 +470,6 @@ def main() -> None:
             f"lr={current_lr:.2e}"
         )
 
-        save_checkpoint(
-            args.output_dir / "last.pt",
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            epoch=epoch,
-            args=args,
-            stats=stats,
-            best_val_loss=best_val_loss,
-        )
-
         if val_metrics["loss"] < best_val_loss:
             best_val_loss = val_metrics["loss"]
             best_epoch = epoch
@@ -348,13 +479,29 @@ def main() -> None:
                 model=model,
                 optimizer=optimizer,
                 scheduler=scheduler,
+                scaler=scaler,
                 epoch=epoch,
                 args=args,
                 stats=stats,
                 best_val_loss=best_val_loss,
+                best_epoch=best_epoch,
             )
         else:
             patience_counter += 1
+
+        save_checkpoint(
+            args.output_dir / "last.pt",
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            epoch=epoch,
+            args=args,
+            stats=stats,
+            best_val_loss=best_val_loss,
+            best_epoch=best_epoch,
+        )
+        append_metrics_csv(metrics_csv_path, epoch, train_metrics, val_metrics, current_lr)
 
         if patience_counter >= args.early_stopping_patience:
             print(
