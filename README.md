@@ -2,11 +2,15 @@
 
 Residual mel-spectrogram restoration on top of an RVQ-VAE output.
 
-This repository now contains a second-stage PyTorch refiner that learns the missing detail as a residual:
+This repository contains second-stage PyTorch refiners that learn to restore missing detail from a coarse VAE/RVQ-VAE mel spectrogram.
+
+The deterministic refiner learns a residual:
 
 `x_hat = x_low + f(x_low)`
 
 where `x_low` is the coarse RVQ-VAE mel and `f(.)` predicts the residual needed to recover the high-detail target.
+
+The conditional diffusion refiner learns the distribution of the missing residual detail and samples it while conditioning on the coarse mel.
 
 ## What is included
 
@@ -17,6 +21,10 @@ where `x_low` is the coarse RVQ-VAE mel and `f(.)` predicts the residual needed 
   - a coarse stage
   - a full-resolution stage
   - a mel-specific sub-band branch
+- A conditional DDPM/DDIM diffusion refiner with:
+  - residual or direct-mel diffusion targets
+  - sinusoidal timestep conditioning
+  - U-Net denoiser with optional bottleneck self-attention
 - Composite loss:
   - `L1`
   - gradient loss
@@ -37,8 +45,11 @@ melrestoration/
   losses.py
   metrics.py
   models.py
+  diffusion.py
   train.py
+  train_diffusion.py
   infer.py
+  infer_diffusion.py
 ```
 
 ## Data layout
@@ -64,6 +75,8 @@ python -m pip install -r requirements.txt
 ```
 
 ## Train
+
+Deterministic residual U-Net example:
 
 Example:
 
@@ -115,6 +128,41 @@ python -m melrestoration.train ^
 
 When resuming, `--epochs` is the total target epoch count, not the number of extra epochs. For example, if the checkpoint was saved at epoch `30` and you want to continue to epoch `120`, use `--epochs 120`.
 
+## Train Conditional Diffusion
+
+The diffusion model uses the same paired data layout. By default it diffuses the residual `target - low`, then adds the sampled residual back to the input mel during inference.
+
+Example:
+
+```bash
+python -m melrestoration.train_diffusion ^
+  --low-dir data/low ^
+  --high-dir data/high ^
+  --output-dir runs/diffusion_v1 ^
+  --group-separator "_" ^
+  --batch-size 16 ^
+  --epochs 200 ^
+  --lr 1e-4 ^
+  --base-channels 64 ^
+  --timesteps 1000 ^
+  --target-mode residual
+```
+
+Useful diffusion flags:
+
+- `--batch-size 8` or `--grad-accum-steps 2` if GPU memory is tight
+- `--channel-mults 1,2,4,4` to control U-Net depth/width
+- `--target-mode mel` to generate the full high-quality mel instead of the residual
+- `--beta-schedule linear` to use a linear DDPM schedule instead of cosine
+- `--no-use-attention` to reduce memory use
+
+Training outputs:
+
+- `best_diffusion.pt`: best validation checkpoint
+- `last_diffusion.pt`: most recent checkpoint
+- `diffusion_metrics.csv`: one row per epoch
+- `stats.json`: shared normalization stats, when z-score normalization is enabled
+
 ## Inference
 
 Single file:
@@ -135,8 +183,24 @@ python -m melrestoration.infer ^
   --output data/test_refined
 ```
 
+Diffusion inference:
+
+```bash
+python -m melrestoration.infer_diffusion ^
+  --checkpoint runs/diffusion_v1/best_diffusion.pt ^
+  --input data/test_low ^
+  --output data/test_diffusion_refined ^
+  --sample-steps 50 ^
+  --eta 0 ^
+  --clip-min -12 ^
+  --clip-max 1
+```
+
+`--sampler ddim` is the default and is much faster than full DDPM sampling. Increase `--sample-steps` for quality; decrease it for speed. Change `--seed` if you want a different stochastic restoration.
+
 ## Notes
 
 - The model predicts a residual, not a full spectrogram from scratch.
+- The diffusion model also defaults to residual prediction. Use `--target-mode mel` only if residual sampling is not stable for your data.
 - The code assumes each `.npy` file contains a single `2D` mel array. A shape like `(1, 128, 128)` is also accepted.
 - `LSD` is computed directly in mel space, which is most meaningful if your stored mel values are already in a log domain.
