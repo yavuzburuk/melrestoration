@@ -28,22 +28,91 @@ def load_mel(path: Path | str) -> np.ndarray:
     return np.asarray(array, dtype=np.float32)
 
 
-def collect_paired_files(low_dir: Path | str, high_dir: Path | str) -> list[PairedMelPath]:
+def _format_path_examples(paths: list[Path], root: Path, limit: int = 5) -> str:
+    if not paths:
+        return "none"
+    examples = [str(path.relative_to(root)) for path in paths[:limit]]
+    if len(paths) > limit:
+        examples.append("...")
+    return ", ".join(examples)
+
+
+def _duplicate_filenames(paths: list[Path]) -> list[str]:
+    counts: dict[str, int] = {}
+    for path in paths:
+        counts[path.name] = counts.get(path.name, 0) + 1
+    return sorted(name for name, count in counts.items() if count > 1)
+
+
+def _raise_no_pairs_error(
+    low_root: Path,
+    high_root: Path,
+    low_files: list[Path],
+    high_files: list[Path],
+    pairing_mode: str,
+) -> None:
+    shared_names = sorted({path.name for path in low_files} & {path.name for path in high_files})
+    basename_hint = (
+        " Matching filenames were found, but not matching relative paths. "
+        "Try --pairing-mode basename if the same filenames are stored under different subfolders."
+        if pairing_mode == "relative" and shared_names
+        else ""
+    )
+    raise FileNotFoundError(
+        f"No paired .npy files found between {low_root} and {high_root}. "
+        f"Pairing mode: {pairing_mode}. "
+        f"Found {len(low_files)} low .npy file(s) and {len(high_files)} high .npy file(s). "
+        f"Low examples: {_format_path_examples(low_files, low_root)}. "
+        f"High examples: {_format_path_examples(high_files, high_root)}. "
+        "Relative pairing requires identical paths under both roots, for example "
+        "data/low/blues/example.npy and data/high/blues/example.npy."
+        f"{basename_hint}"
+    )
+
+
+def collect_paired_files(
+    low_dir: Path | str,
+    high_dir: Path | str,
+    pairing_mode: str = "relative",
+) -> list[PairedMelPath]:
     low_root = Path(low_dir)
     high_root = Path(high_dir)
+    if pairing_mode not in {"relative", "basename"}:
+        raise ValueError("--pairing-mode must be either 'relative' or 'basename'.")
+
+    if not low_root.exists():
+        raise FileNotFoundError(f"Low directory does not exist: {low_root}")
+    if not high_root.exists():
+        raise FileNotFoundError(f"High directory does not exist: {high_root}")
+
+    low_files = sorted(low_root.rglob("*.npy"))
+    high_files = sorted(high_root.rglob("*.npy"))
     pairs: list[PairedMelPath] = []
 
-    for low_path in sorted(low_root.rglob("*.npy")):
-        relative_path = low_path.relative_to(low_root)
-        high_path = high_root / relative_path
-        if high_path.exists():
-            pairs.append(PairedMelPath(relative_path=relative_path, low_path=low_path, high_path=high_path))
+    if pairing_mode == "relative":
+        for low_path in low_files:
+            relative_path = low_path.relative_to(low_root)
+            high_path = high_root / relative_path
+            if high_path.exists():
+                pairs.append(PairedMelPath(relative_path=relative_path, low_path=low_path, high_path=high_path))
+    else:
+        duplicate_low_names = _duplicate_filenames(low_files)
+        duplicate_high_names = _duplicate_filenames(high_files)
+        if duplicate_low_names or duplicate_high_names:
+            raise ValueError(
+                "--pairing-mode basename requires unique filenames in both directories. "
+                f"Duplicate low filenames: {duplicate_low_names[:5] or 'none'}. "
+                f"Duplicate high filenames: {duplicate_high_names[:5] or 'none'}."
+            )
+
+        high_by_name = {path.name: path for path in high_files}
+        for low_path in low_files:
+            high_path = high_by_name.get(low_path.name)
+            if high_path is not None:
+                pairs.append(PairedMelPath(relative_path=Path(low_path.name), low_path=low_path, high_path=high_path))
 
     if not pairs:
-        raise FileNotFoundError(
-            f"No paired .npy files found between {low_root} and {high_root}. "
-            "Expected matching relative paths in both directories."
-        )
+        _raise_no_pairs_error(low_root, high_root, low_files, high_files, pairing_mode)
 
     return pairs
 

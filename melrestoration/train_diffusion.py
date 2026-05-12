@@ -63,6 +63,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stats-path", type=Path, default=None, help="Optional path to an existing shared stats JSON.")
     parser.add_argument("--norm", choices=("none", "zscore"), default="zscore")
     parser.add_argument("--use-deltas", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--pairing-mode",
+        choices=("relative", "basename"),
+        default="relative",
+        help="Use 'relative' for matching subfolder paths or 'basename' for matching filenames only.",
+    )
     parser.add_argument("--group-separator", type=str, default=None)
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
@@ -460,7 +466,7 @@ def main() -> None:
     if resume_checkpoint is not None:
         configure_from_checkpoint(args, resume_checkpoint)
 
-    all_pairs = collect_paired_files(args.low_dir, args.high_dir)
+    all_pairs = collect_paired_files(args.low_dir, args.high_dir, pairing_mode=args.pairing_mode)
     train_pairs, val_pairs = split_pairs(
         all_pairs,
         val_ratio=args.val_ratio,

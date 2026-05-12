@@ -68,6 +68,8 @@ data/
 
 Nested directories are also supported as long as the relative paths match between `low` and `high`.
 
+If the filenames match but the subfolder layout is different, add `--pairing-mode basename`. Basename pairing requires every `.npy` filename to be unique in both folders.
+
 ## Install
 
 ```bash
@@ -85,6 +87,7 @@ python -m melrestoration.train ^
   --low-dir data/low ^
   --high-dir data/high ^
   --output-dir runs/refiner_v1 ^
+  --pairing-mode basename ^
   --group-separator "_" ^
   --batch-size 32 ^
   --epochs 120 ^
@@ -96,6 +99,7 @@ python -m melrestoration.train ^
 Important:
 
 - Use `--group-separator` so windows from the same original clip stay in the same split. For filenames like `clip123_00045.npy`, use `_`.
+- Use `--pairing-mode basename` if files such as `blues.00000ConcertHallLA_02_mel.npy` exist in both folders but not at the same relative subfolder path.
 - If your files are already grouped by folder, you can omit `--group-separator` and the parent directory will be used as the grouping key.
 - On Windows, start with `--num-workers 0`. Increase it only after confirming the data loader is stable in your environment.
 
@@ -139,6 +143,7 @@ python -m melrestoration.train_diffusion ^
   --low-dir data/low ^
   --high-dir data/high ^
   --output-dir runs/diffusion_v1 ^
+  --pairing-mode basename ^
   --group-separator "_" ^
   --batch-size 16 ^
   --epochs 200 ^
