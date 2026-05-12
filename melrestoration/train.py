@@ -5,6 +5,7 @@ import contextlib
 import csv
 import math
 import random
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -12,18 +13,48 @@ import torch
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
-from .data import (
-    PairedMelDataset,
-    collect_paired_files,
-    compute_shared_stats,
-    denormalize_tensor,
-    load_stats,
-    save_stats,
-    split_pairs,
-)
-from .losses import CompositeMelLoss
-from .metrics import lsd_metric, mae_metric, ssim_metric
-from .models import ProgressiveMelRefiner
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    try:
+        from melrestoration.data import (
+            PairedMelDataset,
+            collect_paired_files,
+            compute_shared_stats,
+            denormalize_tensor,
+            load_stats,
+            save_stats,
+            split_pairs,
+        )
+        from melrestoration.losses import CompositeMelLoss
+        from melrestoration.metrics import lsd_metric, mae_metric, ssim_metric
+        from melrestoration.models import ProgressiveMelRefiner
+    except ModuleNotFoundError:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from data import (  # type: ignore[no-redef]
+            PairedMelDataset,
+            collect_paired_files,
+            compute_shared_stats,
+            denormalize_tensor,
+            load_stats,
+            save_stats,
+            split_pairs,
+        )
+        from losses import CompositeMelLoss  # type: ignore[no-redef]
+        from metrics import lsd_metric, mae_metric, ssim_metric  # type: ignore[no-redef]
+        from models import ProgressiveMelRefiner  # type: ignore[no-redef]
+else:
+    from .data import (
+        PairedMelDataset,
+        collect_paired_files,
+        compute_shared_stats,
+        denormalize_tensor,
+        load_stats,
+        save_stats,
+        split_pairs,
+    )
+    from .losses import CompositeMelLoss
+    from .metrics import lsd_metric, mae_metric, ssim_metric
+    from .models import ProgressiveMelRefiner
 
 
 def parse_args() -> argparse.Namespace:

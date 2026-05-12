@@ -2,13 +2,24 @@ from __future__ import annotations
 
 import argparse
 import random
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from .data import compute_delta_features, load_mel, normalize
-from .diffusion import ConditionalDiffusionUNet, GaussianDiffusion
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    try:
+        from melrestoration.data import compute_delta_features, load_mel, normalize
+        from melrestoration.diffusion import ConditionalDiffusionUNet, GaussianDiffusion
+    except ModuleNotFoundError:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from data import compute_delta_features, load_mel, normalize  # type: ignore[no-redef]
+        from diffusion import ConditionalDiffusionUNet, GaussianDiffusion  # type: ignore[no-redef]
+else:
+    from .data import compute_delta_features, load_mel, normalize
+    from .diffusion import ConditionalDiffusionUNet, GaussianDiffusion
 
 
 def parse_args() -> argparse.Namespace:

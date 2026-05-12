@@ -1,13 +1,24 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from .data import compute_delta_features, load_mel, normalize
-from .models import ProgressiveMelRefiner
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    try:
+        from melrestoration.data import compute_delta_features, load_mel, normalize
+        from melrestoration.models import ProgressiveMelRefiner
+    except ModuleNotFoundError:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from data import compute_delta_features, load_mel, normalize  # type: ignore[no-redef]
+        from models import ProgressiveMelRefiner  # type: ignore[no-redef]
+else:
+    from .data import compute_delta_features, load_mel, normalize
+    from .models import ProgressiveMelRefiner
 
 
 def parse_args() -> argparse.Namespace:
