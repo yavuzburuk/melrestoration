@@ -5,7 +5,6 @@ import contextlib
 import csv
 import math
 import random
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -13,34 +12,7 @@ import torch
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    try:
-        from melrestoration.data import (
-            PairedMelDataset,
-            collect_paired_files,
-            compute_shared_stats,
-            denormalize_tensor,
-            load_stats,
-            save_stats,
-            split_pairs,
-        )
-        from melrestoration.diffusion import ConditionalDiffusionUNet, GaussianDiffusion
-        from melrestoration.metrics import lsd_metric, mae_metric, ssim_metric
-    except ModuleNotFoundError:
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from data import (  # type: ignore[no-redef]
-            PairedMelDataset,
-            collect_paired_files,
-            compute_shared_stats,
-            denormalize_tensor,
-            load_stats,
-            save_stats,
-            split_pairs,
-        )
-        from diffusion import ConditionalDiffusionUNet, GaussianDiffusion  # type: ignore[no-redef]
-        from metrics import lsd_metric, mae_metric, ssim_metric  # type: ignore[no-redef]
-else:
+if __package__:
     from .data import (
         PairedMelDataset,
         collect_paired_files,
@@ -52,6 +24,18 @@ else:
     )
     from .diffusion import ConditionalDiffusionUNet, GaussianDiffusion
     from .metrics import lsd_metric, mae_metric, ssim_metric
+else:
+    from data import (
+        PairedMelDataset,
+        collect_paired_files,
+        compute_shared_stats,
+        denormalize_tensor,
+        load_stats,
+        save_stats,
+        split_pairs,
+    )
+    from diffusion import ConditionalDiffusionUNet, GaussianDiffusion
+    from metrics import lsd_metric, mae_metric, ssim_metric
 
 
 def parse_args() -> argparse.Namespace:

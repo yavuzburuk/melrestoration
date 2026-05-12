@@ -4,10 +4,10 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-if __package__ in (None, ""):
-    from metrics import ssim_metric
-else:
+if __package__:
     from .metrics import ssim_metric
+else:
+    from metrics import ssim_metric
 
 
 def _frequency_weights(reference: torch.Tensor, boost: float) -> torch.Tensor:

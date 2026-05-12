@@ -40,6 +40,8 @@ The conditional diffusion refiner learns the distribution of the missing residua
 
 ```text
 melrestoration/
+  README.md
+  requirements.txt
   __init__.py
   data.py
   losses.py
@@ -51,6 +53,8 @@ melrestoration/
   infer.py
   infer_diffusion.py
 ```
+
+All Python files live directly in the repository root. Run commands from this directory.
 
 ## Data layout
 
@@ -83,7 +87,7 @@ Deterministic residual U-Net example:
 Example:
 
 ```bash
-python -m melrestoration.train ^
+python train.py ^
   --low-dir data/low ^
   --high-dir data/high ^
   --output-dir runs/refiner_v1 ^
@@ -120,7 +124,7 @@ Training outputs:
 Resume training from the last checkpoint:
 
 ```bash
-python -m melrestoration.train ^
+python train.py ^
   --low-dir data/low ^
   --high-dir data/high ^
   --output-dir runs/refiner_v1 ^
@@ -139,7 +143,7 @@ The diffusion model uses the same paired data layout. By default it diffuses the
 Example:
 
 ```bash
-python -m melrestoration.train_diffusion ^
+python train_diffusion.py ^
   --low-dir data/low ^
   --high-dir data/high ^
   --output-dir runs/diffusion_v1 ^
@@ -173,7 +177,7 @@ Training outputs:
 Single file:
 
 ```bash
-python -m melrestoration.infer ^
+python infer.py ^
   --checkpoint runs/refiner_v1/best.pt ^
   --input samples/r1.npy ^
   --output samples/r1_refined.npy
@@ -182,7 +186,7 @@ python -m melrestoration.infer ^
 Directory:
 
 ```bash
-python -m melrestoration.infer ^
+python infer.py ^
   --checkpoint runs/refiner_v1/best.pt ^
   --input data/test_low ^
   --output data/test_refined
@@ -191,7 +195,7 @@ python -m melrestoration.infer ^
 Diffusion inference:
 
 ```bash
-python -m melrestoration.infer_diffusion ^
+python infer_diffusion.py ^
   --checkpoint runs/diffusion_v1/best_diffusion.pt ^
   --input data/test_low ^
   --output data/test_diffusion_refined ^
