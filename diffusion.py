@@ -75,6 +75,14 @@ class GaussianDiffusion(nn.Module):
 
         posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
         self.register_buffer("posterior_variance", posterior_variance.clamp(min=1e-20))
+        self.register_buffer(
+            "posterior_mean_coef1",
+            betas * torch.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod),
+        )
+        self.register_buffer(
+            "posterior_mean_coef2",
+            (1.0 - alphas_cumprod_prev) * torch.sqrt(alphas) / (1.0 - alphas_cumprod),
+        )
 
     def config(self) -> dict[str, float | int | str]:
         return {
@@ -101,6 +109,34 @@ class GaussianDiffusion(nn.Module):
             - _extract(self.sqrt_recipm1_alphas_cumprod, timesteps, x_t.shape) * noise
         )
 
+    def predict_noise_from_x_start(
+        self,
+        x_t: torch.Tensor,
+        timesteps: torch.Tensor,
+        x_start: torch.Tensor,
+    ) -> torch.Tensor:
+        return (
+            x_t - _extract(self.sqrt_alphas_cumprod, timesteps, x_t.shape) * x_start
+        ) / _extract(self.sqrt_one_minus_alphas_cumprod, timesteps, x_t.shape)
+
+    def q_sample_from_optional_start(
+        self,
+        initial_x: torch.Tensor | None,
+        shape: tuple[int, int, int, int],
+        start_timestep: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if initial_x is None:
+            return torch.randn(shape, device=device, dtype=dtype)
+        if initial_x.shape != shape:
+            raise ValueError(f"Expected initial_x shape {shape}, got {tuple(initial_x.shape)}.")
+        x_start = initial_x.to(device=device, dtype=dtype)
+        if start_timestep <= 0:
+            return x_start
+        timesteps = torch.full((shape[0],), start_timestep, device=device, dtype=torch.long)
+        return self.q_sample(x_start, timesteps, torch.randn_like(x_start))
+
     @torch.no_grad()
     def p_sample(
         self,
@@ -108,13 +144,16 @@ class GaussianDiffusion(nn.Module):
         x_t: torch.Tensor,
         condition: torch.Tensor,
         timesteps: torch.Tensor,
+        x0_clip: float | None = None,
     ) -> torch.Tensor:
         predicted_noise = model(x_t, condition, timesteps)
-        beta_t = _extract(self.betas, timesteps, x_t.shape)
-        sqrt_one_minus_alpha_cumprod_t = _extract(self.sqrt_one_minus_alphas_cumprod, timesteps, x_t.shape)
-        sqrt_recip_alpha_t = _extract(self.sqrt_recip_alphas, timesteps, x_t.shape)
-
-        model_mean = sqrt_recip_alpha_t * (x_t - beta_t * predicted_noise / sqrt_one_minus_alpha_cumprod_t)
+        predicted_x0 = self.predict_x_start_from_noise(x_t, timesteps, predicted_noise)
+        if x0_clip is not None and x0_clip > 0:
+            predicted_x0 = predicted_x0.clamp(-x0_clip, x0_clip)
+        model_mean = (
+            _extract(self.posterior_mean_coef1, timesteps, x_t.shape) * predicted_x0
+            + _extract(self.posterior_mean_coef2, timesteps, x_t.shape) * x_t
+        )
         posterior_variance_t = _extract(self.posterior_variance, timesteps, x_t.shape)
         noise = torch.randn_like(x_t)
         nonzero_mask = (timesteps != 0).float().view(x_t.shape[0], *((1,) * (x_t.ndim - 1)))
@@ -126,11 +165,22 @@ class GaussianDiffusion(nn.Module):
         model: nn.Module,
         condition: torch.Tensor,
         shape: tuple[int, int, int, int],
+        initial_x: torch.Tensor | None = None,
+        start_timestep: int | None = None,
+        x0_clip: float | None = None,
     ) -> torch.Tensor:
-        x_t = torch.randn(shape, device=condition.device, dtype=condition.dtype)
-        for step in reversed(range(self.timesteps)):
+        start_timestep = self.timesteps - 1 if start_timestep is None else int(start_timestep)
+        start_timestep = max(0, min(start_timestep, self.timesteps - 1))
+        x_t = self.q_sample_from_optional_start(
+            initial_x,
+            shape,
+            start_timestep,
+            device=condition.device,
+            dtype=condition.dtype,
+        )
+        for step in reversed(range(start_timestep + 1)):
             timesteps = torch.full((shape[0],), step, device=condition.device, dtype=torch.long)
-            x_t = self.p_sample(model, x_t, condition, timesteps)
+            x_t = self.p_sample(model, x_t, condition, timesteps, x0_clip=x0_clip)
         return x_t
 
     @torch.no_grad()
@@ -141,19 +191,35 @@ class GaussianDiffusion(nn.Module):
         shape: tuple[int, int, int, int],
         steps: int = 50,
         eta: float = 0.0,
+        initial_x: torch.Tensor | None = None,
+        start_timestep: int | None = None,
+        x0_clip: float | None = None,
     ) -> torch.Tensor:
         if steps < 2:
             raise ValueError("--sample-steps must be at least 2.")
-        if steps > self.timesteps:
-            raise ValueError("--sample-steps cannot be greater than the training diffusion timesteps.")
 
-        x_t = torch.randn(shape, device=condition.device, dtype=condition.dtype)
-        sequence = torch.linspace(self.timesteps - 1, 0, steps, device=condition.device).long()
+        start_timestep = self.timesteps - 1 if start_timestep is None else int(start_timestep)
+        start_timestep = max(0, min(start_timestep, self.timesteps - 1))
+        steps = min(steps, start_timestep + 1)
+        x_t = self.q_sample_from_optional_start(
+            initial_x,
+            shape,
+            start_timestep,
+            device=condition.device,
+            dtype=condition.dtype,
+        )
+        if start_timestep == 0:
+            return x_t
+
+        sequence = torch.linspace(start_timestep, 0, steps, device=condition.device).long().unique_consecutive()
 
         for index, step in enumerate(sequence):
             timesteps = torch.full((shape[0],), int(step.item()), device=condition.device, dtype=torch.long)
             predicted_noise = model(x_t, condition, timesteps)
             predicted_x0 = self.predict_x_start_from_noise(x_t, timesteps, predicted_noise)
+            if x0_clip is not None and x0_clip > 0:
+                predicted_x0 = predicted_x0.clamp(-x0_clip, x0_clip)
+                predicted_noise = self.predict_noise_from_x_start(x_t, timesteps, predicted_x0)
 
             if index == len(sequence) - 1:
                 x_t = predicted_x0

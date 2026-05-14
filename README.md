@@ -23,6 +23,8 @@ The conditional diffusion refiner learns the distribution of the missing residua
   - a mel-specific sub-band branch
 - A conditional DDPM/DDIM diffusion refiner with:
   - residual or direct-mel diffusion targets
+  - z-score normalization for the diffusion target
+  - low-mel anchored restoration sampling
   - sinusoidal timestep conditioning
   - U-Net denoiser with optional bottleneck self-attention
 - Composite loss:
@@ -162,6 +164,7 @@ Useful diffusion flags:
 - `--batch-size 8` or `--grad-accum-steps 2` if GPU memory is tight
 - `--channel-mults 1,2,4,4` to control U-Net depth/width
 - `--target-mode mel` to generate the full high-quality mel instead of the residual
+- `--diffusion-target-norm none` to disable z-score normalization of the diffusion target
 - `--beta-schedule linear` to use a linear DDPM schedule instead of cosine
 - `--no-use-attention` to reduce memory use
 
@@ -171,6 +174,7 @@ Training outputs:
 - `last_diffusion.pt`: most recent checkpoint
 - `diffusion_metrics.csv`: one row per epoch
 - `stats.json`: shared normalization stats, when z-score normalization is enabled
+- `diffusion_target_stats.json`: normalization stats for the diffusion target
 
 ## Inference
 
@@ -200,16 +204,19 @@ python infer_diffusion.py ^
   --input data/test_low ^
   --output data/test_diffusion_refined ^
   --sample-steps 50 ^
+  --init-mode condition ^
+  --strength 0.35 ^
   --eta 0 ^
   --clip-min -12 ^
   --clip-max 1
 ```
 
-`--sampler ddim` is the default and is much faster than full DDPM sampling. Increase `--sample-steps` for quality; decrease it for speed. Change `--seed` if you want a different stochastic restoration.
+`--sampler ddim` is the default and is much faster than full DDPM sampling. `--init-mode condition` starts from the low mel or a zero residual with controlled noise, then denoises; this is safer for restoration than full random generation. Increase `--strength` for more generated detail, decrease it if the output becomes noisy. Change `--seed` if you want a different stochastic restoration.
 
 ## Notes
 
 - The model predicts a residual, not a full spectrogram from scratch.
 - The diffusion model also defaults to residual prediction. Use `--target-mode mel` only if residual sampling is not stable for your data.
+- If diffusion output looks like clipped noise, use `--init-mode condition --strength 0.2` to `0.4` and retrain with the default `--diffusion-target-norm zscore`.
 - The code assumes each `.npy` file contains a single `2D` mel array. A shape like `(1, 128, 128)` is also accepted.
 - `LSD` is computed directly in mel space, which is most meaningful if your stored mel values are already in a log domain.

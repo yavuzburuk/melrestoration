@@ -23,6 +23,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sampler", choices=("ddim", "ddpm"), default="ddim")
     parser.add_argument("--sample-steps", type=int, default=50, help="DDIM steps. Ignored when --sampler ddpm is used.")
     parser.add_argument("--eta", type=float, default=0.0, help="DDIM stochasticity. Use 0 for deterministic sampling.")
+    parser.add_argument(
+        "--init-mode",
+        choices=("condition", "random"),
+        default="condition",
+        help="Use 'condition' to denoise from the low mel/zero residual, or 'random' for full generation.",
+    )
+    parser.add_argument(
+        "--strength",
+        type=float,
+        default=0.35,
+        help="Noise strength for --init-mode condition. Lower values stay closer to the input.",
+    )
+    parser.add_argument(
+        "--x0-clip",
+        type=float,
+        default=4.0,
+        help="Clamp predicted diffusion target in normalized space during sampling. Use 0 to disable.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--clip-min", type=float, default=None, help="Optional output clamp in original mel scale.")
     parser.add_argument("--clip-max", type=float, default=None, help="Optional output clamp in original mel scale.")
@@ -48,7 +66,14 @@ def choose_device(device_arg: str | None) -> torch.device:
 def build_model(
     checkpoint: dict,
     device: torch.device,
-) -> tuple[ConditionalDiffusionUNet, GaussianDiffusion, dict[str, float] | None, bool, str]:
+) -> tuple[
+    ConditionalDiffusionUNet,
+    GaussianDiffusion,
+    dict[str, float] | None,
+    dict[str, float] | None,
+    bool,
+    str,
+]:
     model_config = checkpoint["model_config"]
     model = ConditionalDiffusionUNet(
         cond_channels=int(model_config["cond_channels"]),
@@ -74,7 +99,8 @@ def build_model(
     use_deltas = bool(args.get("use_deltas", model_config["cond_channels"] > 1))
     target_mode = str(args.get("target_mode", "residual"))
     stats = checkpoint.get("stats")
-    return model, diffusion, stats, use_deltas, target_mode
+    target_stats = checkpoint.get("target_stats")
+    return model, diffusion, stats, target_stats, use_deltas, target_mode
 
 
 def build_condition_tensor(
@@ -100,6 +126,18 @@ def denormalize_array(array: np.ndarray, stats: dict[str, float] | None) -> np.n
     return array * max(float(stats["std"]), 1e-6) + float(stats["mean"])
 
 
+def normalize_diffusion_target(target: torch.Tensor, target_stats: dict[str, float] | None) -> torch.Tensor:
+    if target_stats is None:
+        return target
+    return (target - float(target_stats["mean"])) / max(float(target_stats["std"]), 1e-6)
+
+
+def denormalize_diffusion_target(target: torch.Tensor, target_stats: dict[str, float] | None) -> torch.Tensor:
+    if target_stats is None:
+        return target
+    return target * max(float(target_stats["std"]), 1e-6) + float(target_stats["mean"])
+
+
 def iter_inputs(input_path: Path) -> list[tuple[Path, Path]]:
     if input_path.is_file():
         return [(input_path, Path(input_path.name))]
@@ -114,13 +152,38 @@ def restore_prediction(low: torch.Tensor, sampled_x0: torch.Tensor, target_mode:
     raise ValueError(f"Unsupported diffusion target mode in checkpoint: {target_mode}")
 
 
+def build_initial_diffusion_target(
+    low: torch.Tensor,
+    target_mode: str,
+    target_stats: dict[str, float] | None,
+    init_mode: str,
+) -> torch.Tensor | None:
+    if init_mode == "random":
+        return None
+    if target_mode == "residual":
+        initial = torch.zeros_like(low)
+    elif target_mode == "mel":
+        initial = low
+    else:
+        raise ValueError(f"Unsupported diffusion target mode in checkpoint: {target_mode}")
+    return normalize_diffusion_target(initial, target_stats)
+
+
+def resolve_start_timestep(diffusion: GaussianDiffusion, strength: float, init_mode: str) -> int | None:
+    if init_mode == "random":
+        return None
+    strength = max(0.0, min(float(strength), 1.0))
+    return int(round((diffusion.timesteps - 1) * strength))
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
     device = choose_device(args.device)
 
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    model, diffusion, stats, use_deltas, target_mode = build_model(checkpoint, device)
+    model, diffusion, stats, target_stats, use_deltas, target_mode = build_model(checkpoint, device)
+    x0_clip = None if args.x0_clip is None or args.x0_clip <= 0 else args.x0_clip
 
     items = iter_inputs(args.input)
     if not items:
@@ -133,9 +196,18 @@ def main() -> None:
         low = low.to(device)
 
         shape = (1, 1, condition.shape[-2], condition.shape[-1])
+        initial_x = build_initial_diffusion_target(low, target_mode, target_stats, args.init_mode)
+        start_timestep = resolve_start_timestep(diffusion, args.strength, args.init_mode)
         with torch.no_grad():
             if args.sampler == "ddpm":
-                sampled_x0 = diffusion.sample_ddpm(model, condition, shape)
+                sampled_x0 = diffusion.sample_ddpm(
+                    model,
+                    condition,
+                    shape,
+                    initial_x=initial_x,
+                    start_timestep=start_timestep,
+                    x0_clip=x0_clip,
+                )
             else:
                 sampled_x0 = diffusion.sample_ddim(
                     model,
@@ -143,8 +215,12 @@ def main() -> None:
                     shape,
                     steps=args.sample_steps,
                     eta=args.eta,
+                    initial_x=initial_x,
+                    start_timestep=start_timestep,
+                    x0_clip=x0_clip,
                 )
-            prediction = restore_prediction(low, sampled_x0, target_mode)[0, 0].detach().cpu().numpy()
+            raw_sampled_x0 = denormalize_diffusion_target(sampled_x0, target_stats)
+            prediction = restore_prediction(low, raw_sampled_x0, target_mode)[0, 0].detach().cpu().numpy()
 
         prediction = denormalize_array(prediction, stats).astype(np.float32, copy=False)
         if args.clip_min is not None or args.clip_max is not None:

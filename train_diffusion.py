@@ -18,7 +18,9 @@ if __package__:
         collect_paired_files,
         compute_shared_stats,
         denormalize_tensor,
+        load_mel,
         load_stats,
+        normalize,
         save_stats,
         split_pairs,
     )
@@ -30,7 +32,9 @@ else:
         collect_paired_files,
         compute_shared_stats,
         denormalize_tensor,
+        load_mel,
         load_stats,
+        normalize,
         save_stats,
         split_pairs,
     )
@@ -71,8 +75,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--beta-start", type=float, default=1e-4)
     parser.add_argument("--beta-end", type=float, default=2e-2)
     parser.add_argument("--target-mode", choices=("residual", "mel"), default="residual")
+    parser.add_argument("--diffusion-target-norm", choices=("none", "zscore"), default="zscore")
+    parser.add_argument("--target-stats-path", type=Path, default=None)
     parser.add_argument("--noise-loss", choices=("mse", "l1"), default="mse")
-    parser.add_argument("--x0-loss-weight", type=float, default=0.1)
+    parser.add_argument("--x0-loss-weight", type=float, default=1.0)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--scheduler", choices=("cosine", "plateau", "none"), default="cosine")
@@ -198,6 +204,12 @@ def configure_from_checkpoint(args: argparse.Namespace, checkpoint: dict) -> Non
     args.dropout = float(model_config.get("dropout", args.dropout))
     args.use_attention = bool(model_config.get("use_attention", args.use_attention))
     args.target_mode = str(checkpoint_args.get("target_mode", args.target_mode))
+    args.diffusion_target_norm = str(
+        checkpoint_args.get(
+            "diffusion_target_norm",
+            "zscore" if checkpoint.get("target_stats") is not None else "none",
+        )
+    )
     args.timesteps = int(diffusion_config.get("timesteps", args.timesteps))
     args.beta_schedule = str(diffusion_config.get("beta_schedule", args.beta_schedule))
     args.beta_start = float(diffusion_config.get("beta_start", args.beta_start))
@@ -220,6 +232,65 @@ def resolve_training_stats(
         return stats, resolved_path
 
     return resolve_stats(args.norm, args.stats_path, args.output_dir, train_pairs)
+
+
+def compute_diffusion_target_stats(
+    pairs,
+    shared_stats: dict[str, float] | None,
+    target_mode: str,
+) -> dict[str, float]:
+    total_sum = 0.0
+    total_sq_sum = 0.0
+    total_count = 0
+
+    for pair in pairs:
+        low = normalize(load_mel(pair.low_path), shared_stats).astype(np.float64, copy=False)
+        high = normalize(load_mel(pair.high_path), shared_stats).astype(np.float64, copy=False)
+        if target_mode == "residual":
+            target = high - low
+        elif target_mode == "mel":
+            target = high
+        else:
+            raise ValueError(f"Unsupported diffusion target mode: {target_mode}")
+
+        total_sum += float(target.sum())
+        total_sq_sum += float(np.square(target).sum())
+        total_count += int(target.size)
+
+    if total_count == 0:
+        raise ValueError("Cannot compute diffusion target statistics for an empty dataset.")
+
+    mean = total_sum / total_count
+    variance = max((total_sq_sum / total_count) - (mean * mean), 1e-12)
+    return {"mean": float(mean), "std": float(math.sqrt(variance))}
+
+
+def resolve_diffusion_target_stats(
+    args: argparse.Namespace,
+    train_pairs,
+    shared_stats: dict[str, float] | None,
+    checkpoint: dict | None,
+) -> tuple[dict[str, float] | None, Path | None]:
+    if checkpoint is not None and "target_stats" in checkpoint:
+        target_stats = checkpoint["target_stats"]
+        if target_stats is None:
+            return None, None
+
+        resolved_path = args.target_stats_path or (args.output_dir / "diffusion_target_stats.json")
+        if not resolved_path.exists():
+            save_stats(target_stats, resolved_path)
+        return target_stats, resolved_path
+
+    if args.diffusion_target_norm == "none":
+        return None, None
+
+    resolved_path = args.target_stats_path or (args.output_dir / "diffusion_target_stats.json")
+    if resolved_path.exists():
+        target_stats = load_stats(resolved_path)
+    else:
+        target_stats = compute_diffusion_target_stats(train_pairs, shared_stats, args.target_mode)
+        save_stats(target_stats, resolved_path)
+    return target_stats, resolved_path
 
 
 def initialize_metrics_csv(path: Path, resume_epoch: int = 0) -> None:
@@ -304,6 +375,7 @@ def save_checkpoint(
     epoch: int,
     args: argparse.Namespace,
     stats: dict[str, float] | None,
+    target_stats: dict[str, float] | None,
     best_val_loss: float,
     best_epoch: int,
 ) -> None:
@@ -315,6 +387,7 @@ def save_checkpoint(
         "scaler_state_dict": scaler.state_dict() if scaler is not None and scaler.is_enabled() else None,
         "args": serialize_args(args),
         "stats": stats,
+        "target_stats": target_stats,
         "best_val_loss": best_val_loss,
         "best_epoch": best_epoch,
         "model_config": model.config(),
@@ -329,6 +402,24 @@ def diffusion_training_target(low: torch.Tensor, target: torch.Tensor, mode: str
     if mode == "mel":
         return target
     raise ValueError(f"Unsupported diffusion target mode: {mode}")
+
+
+def normalize_diffusion_target(
+    target: torch.Tensor,
+    target_stats: dict[str, float] | None,
+) -> torch.Tensor:
+    if target_stats is None:
+        return target
+    return (target - float(target_stats["mean"])) / max(float(target_stats["std"]), 1e-6)
+
+
+def denormalize_diffusion_target(
+    target: torch.Tensor,
+    target_stats: dict[str, float] | None,
+) -> torch.Tensor:
+    if target_stats is None:
+        return target
+    return target * max(float(target_stats["std"]), 1e-6) + float(target_stats["mean"])
 
 
 def restored_from_diffusion_target(low: torch.Tensor, predicted_x0: torch.Tensor, mode: str) -> torch.Tensor:
@@ -355,6 +446,7 @@ def run_epoch(
     scaler: torch.cuda.amp.GradScaler | None,
     device: torch.device,
     stats: dict[str, float] | None,
+    target_stats: dict[str, float] | None,
     amp_enabled: bool,
     target_mode: str,
     noise_loss_kind: str,
@@ -389,14 +481,16 @@ def run_epoch(
 
         with torch.set_grad_enabled(training):
             with autocast_context():
-                x_start = diffusion_training_target(low, target, target_mode)
+                raw_x_start = diffusion_training_target(low, target, target_mode)
+                x_start = normalize_diffusion_target(raw_x_start, target_stats)
                 timesteps = torch.randint(0, diffusion.timesteps, (batch_size,), device=device, dtype=torch.long)
                 noise = torch.randn_like(x_start)
                 noisy = diffusion.q_sample(x_start, timesteps, noise)
                 predicted_noise = model(noisy, condition, timesteps)
                 noise_loss = diffusion_noise_loss(predicted_noise, noise, noise_loss_kind)
                 predicted_x0 = diffusion.predict_x_start_from_noise(noisy, timesteps, predicted_noise)
-                restored = restored_from_diffusion_target(low, predicted_x0, target_mode)
+                raw_predicted_x0 = denormalize_diffusion_target(predicted_x0, target_stats)
+                restored = restored_from_diffusion_target(low, raw_predicted_x0, target_mode)
                 x0_l1 = F.l1_loss(restored, target)
                 total_loss = noise_loss + (x0_loss_weight * x0_l1)
 
@@ -458,6 +552,12 @@ def main() -> None:
         group_separator=args.group_separator,
     )
     stats, resolved_stats_path = resolve_training_stats(args, train_pairs, resume_checkpoint)
+    target_stats, resolved_target_stats_path = resolve_diffusion_target_stats(
+        args,
+        train_pairs,
+        shared_stats=stats,
+        checkpoint=resume_checkpoint,
+    )
 
     train_dataset = PairedMelDataset(train_pairs, stats=stats, use_deltas=args.use_deltas)
     val_dataset = PairedMelDataset(val_pairs, stats=stats, use_deltas=args.use_deltas)
@@ -503,6 +603,7 @@ def main() -> None:
     print(f"Device: {device}")
     print(f"Training pairs: {len(train_pairs)} | Validation pairs: {len(val_pairs)}")
     print(f"Condition channels: {cond_channels} | Shared stats: {resolved_stats_path or 'disabled'}")
+    print(f"Diffusion target stats: {resolved_target_stats_path or 'disabled'}")
     print(f"Target mode: {args.target_mode} | Timesteps: {args.timesteps} | Schedule: {args.beta_schedule}")
 
     start_epoch = 0
@@ -544,6 +645,7 @@ def main() -> None:
             scaler=scaler,
             device=device,
             stats=stats,
+            target_stats=target_stats,
             amp_enabled=args.amp,
             target_mode=args.target_mode,
             noise_loss_kind=args.noise_loss,
@@ -560,6 +662,7 @@ def main() -> None:
             scaler=None,
             device=device,
             stats=stats,
+            target_stats=target_stats,
             amp_enabled=args.amp,
             target_mode=args.target_mode,
             noise_loss_kind=args.noise_loss,
@@ -599,6 +702,7 @@ def main() -> None:
                 epoch=epoch,
                 args=args,
                 stats=stats,
+                target_stats=target_stats,
                 best_val_loss=best_val_loss,
                 best_epoch=best_epoch,
             )
@@ -615,6 +719,7 @@ def main() -> None:
             epoch=epoch,
             args=args,
             stats=stats,
+            target_stats=target_stats,
             best_val_loss=best_val_loss,
             best_epoch=best_epoch,
         )
